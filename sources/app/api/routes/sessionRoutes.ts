@@ -1,11 +1,11 @@
-import { eventRouter, buildNewSessionUpdate } from "@/app/events/eventRouter";
+import { eventRouter, buildNewSessionUpdate, buildNewMessageUpdate } from "@/app/events/eventRouter";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
 import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
-import { allocateUserSeq } from "@/storage/seq";
+import { allocateUserSeq, allocateSessionSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 
 export function sessionRoutes(app: Fastify) {
@@ -322,6 +322,184 @@ export function sessionRoutes(app: Fastify) {
         const { limit = 150, beforeSeq } = request.query || {};
 
         // Verify session belongs to user
+        const session = await db.session.findFirst({
+            where: {
+                id: sessionId,
+                accountId: userId
+            }
+        });
+
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
+        }
+
+        const where: Prisma.SessionMessageWhereInput = { sessionId };
+        if (beforeSeq !== undefined) {
+            where.seq = { lt: beforeSeq };
+        }
+
+        const messages = await db.sessionMessage.findMany({
+            where,
+            orderBy: { seq: 'desc' },
+            take: limit + 1,
+            select: {
+                id: true,
+                seq: true,
+                localId: true,
+                content: true,
+                createdAt: true,
+                updatedAt: true
+            }
+        });
+
+        const hasMore = messages.length > limit;
+        const resultMessages = hasMore ? messages.slice(0, limit) : messages;
+        const nextBeforeSeq = hasMore && resultMessages.length > 0
+            ? resultMessages[resultMessages.length - 1].seq
+            : null;
+
+        return reply.send({
+            messages: resultMessages.map((v) => ({
+                id: v.id,
+                seq: v.seq,
+                content: v.content,
+                localId: v.localId,
+                createdAt: v.createdAt.getTime(),
+                updatedAt: v.updatedAt.getTime()
+            })),
+            hasMore,
+            nextBeforeSeq
+        });
+    });
+
+    // v3 POST batch send + fetch: iOS App 1.7.0+ posts new messages and polls for new ones in one request
+    app.post('/v3/sessions/:sessionId/messages', {
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            }),
+            querystring: z.object({
+                limit: z.coerce.number().int().min(1).max(500).default(100),
+                after_seq: z.coerce.number().int().min(0).optional(),
+                afterSeq: z.coerce.number().int().min(0).optional(),
+                before_seq: z.coerce.number().int().min(1).optional(),
+                beforeSeq: z.coerce.number().int().min(1).optional(),
+            }).optional(),
+            body: z.object({
+                messages: z.array(z.object({
+                    localId: z.string().optional(),
+                    content: z.string(),
+                })).default([]),
+            }).default({ messages: [] }),
+        },
+        preHandler: app.authenticate
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+        const query: any = request.query || {};
+        const limit = query.limit ?? 100;
+        const afterSeq = query.after_seq ?? query.afterSeq;
+        const beforeSeq = query.before_seq ?? query.beforeSeq;
+        const body = (request.body || {}) as { messages?: Array<{ localId?: string; content: string }> };
+        const incomingMessages = body.messages ?? [];
+
+        const session = await db.session.findFirst({
+            where: { id: sessionId, accountId: userId }
+        });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
+        }
+
+        for (const incoming of incomingMessages) {
+            const useLocalId = typeof incoming.localId === 'string' ? incoming.localId : null;
+
+            if (useLocalId) {
+                const existing = await db.sessionMessage.findFirst({
+                    where: { sessionId, localId: useLocalId }
+                });
+                if (existing) continue;
+            }
+
+            const updSeq = await allocateUserSeq(userId);
+            const msgSeq = await allocateSessionSeq(sessionId);
+            const msg = await db.sessionMessage.create({
+                data: {
+                    sessionId,
+                    seq: msgSeq,
+                    content: { t: 'encrypted', c: incoming.content },
+                    localId: useLocalId
+                }
+            });
+
+            const updatePayload = buildNewMessageUpdate(msg, sessionId, updSeq, randomKeyNaked(12));
+            eventRouter.emitUpdate({
+                userId,
+                payload: updatePayload,
+                recipientFilter: { type: 'all-interested-in-session', sessionId },
+            });
+        }
+
+        const where: Prisma.SessionMessageWhereInput = { sessionId };
+        if (afterSeq !== undefined) {
+            where.seq = { gt: afterSeq };
+        } else if (beforeSeq !== undefined) {
+            where.seq = { lt: beforeSeq };
+        }
+
+        const messages = await db.sessionMessage.findMany({
+            where,
+            orderBy: { seq: 'desc' },
+            take: limit + 1,
+            select: {
+                id: true,
+                seq: true,
+                localId: true,
+                content: true,
+                createdAt: true,
+                updatedAt: true
+            }
+        });
+
+        const hasMore = messages.length > limit;
+        const resultMessages = hasMore ? messages.slice(0, limit) : messages;
+        const nextBeforeSeq = hasMore && resultMessages.length > 0
+            ? resultMessages[resultMessages.length - 1].seq
+            : null;
+
+        return reply.send({
+            messages: resultMessages.map((v) => ({
+                id: v.id,
+                seq: v.seq,
+                content: v.content,
+                localId: v.localId,
+                createdAt: v.createdAt.getTime(),
+                updatedAt: v.updatedAt.getTime()
+            })),
+            hasMore,
+            nextBeforeSeq
+        });
+    });
+
+    // v3 alias for iOS App 1.7.0+ compatibility (snake_case before_seq query param)
+    app.get('/v3/sessions/:sessionId/messages', {
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            }),
+            querystring: z.object({
+                limit: z.coerce.number().int().min(1).max(500).default(150),
+                before_seq: z.coerce.number().int().min(1).optional(),
+                beforeSeq: z.coerce.number().int().min(1).optional(),
+            }).optional()
+        },
+        preHandler: app.authenticate
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+        const query: any = request.query || {};
+        const limit = query.limit ?? 150;
+        const beforeSeq = query.before_seq ?? query.beforeSeq;
+
         const session = await db.session.findFirst({
             where: {
                 id: sessionId,
