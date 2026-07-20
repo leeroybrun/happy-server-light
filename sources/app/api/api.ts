@@ -6,6 +6,7 @@ import { Fastify } from "./types";
 import { authRoutes } from "./routes/authRoutes";
 import { pushRoutes } from "./routes/pushRoutes";
 import { sessionRoutes } from "./routes/sessionRoutes";
+import { v3SessionRoutes } from "./routes/v3SessionRoutes";
 import { connectRoutes } from "./routes/connectRoutes";
 import { accountRoutes } from "./routes/accountRoutes";
 import { startSocket } from "./socket";
@@ -75,13 +76,13 @@ export async function startApi() {
                 reply.header('content-type', 'text/html; charset=utf-8');
                 reply.header('cache-control', 'no-cache');
             } else if (ext === '.js') {
-                reply.header('content-type', 'text/javascript; charset=utf-8');
+                reply.header('content-type', 'text/javascript');
                 reply.header('cache-control', 'public, max-age=31536000, immutable');
             } else if (ext === '.css') {
-                reply.header('content-type', 'text/css; charset=utf-8');
+                reply.header('content-type', 'text/css');
                 reply.header('cache-control', 'public, max-age=31536000, immutable');
             } else if (ext === '.json') {
-                reply.header('content-type', 'application/json; charset=utf-8');
+                reply.header('content-type', 'application/json');
                 reply.header('cache-control', 'public, max-age=31536000, immutable');
             } else if (ext === '.svg') {
                 reply.header('content-type', 'image/svg+xml');
@@ -277,6 +278,7 @@ export async function startApi() {
     authRoutes(typed);
     pushRoutes(typed);
     sessionRoutes(typed);
+    v3SessionRoutes(typed);
     accountRoutes(typed);
     connectRoutes(typed);
     machinesRoutes(typed);
